@@ -1,9 +1,10 @@
 # deploy-vps-api
 
-Автоматический скрипт разворачивания FastAPI REST API на чистом VPS для удалённого управления через HTTPS.
+Автоматическое разворачивание FastAPI REST API на чистом VPS для удалённого управления через HTTPS.
 
 ## Возможности
 
+- Запускается прямо на VPS без внешнего SSH
 - Автоматическая установка Python 3.12, venv, FastAPI, Uvicorn
 - Генерация самоподписанного SSL сертификата
 - Systemd сервис с автозапуском
@@ -13,37 +14,38 @@
 ## Требования
 
 - Чистый VPS на Ubuntu 22.04+ / Debian 12+
-- SSH доступ с ключом
-- Открытый порт 443 в firewall
+- Root доступ
+- Открытый порт 443
 
-## Быстрый старт
+## Установка
 
-1. Скачайте скрипт на локальную машину:
 ```bash
-curl -O https://raw.githubusercontent.com/krygag1234-a11y/deploy-vps-api/main/deploy-vps-api.sh
+wget -O deploy-vps-api.sh https://raw.githubusercontent.com/krygag1234-a11y/deploy-vps-api/main/deploy-vps-api.sh
 chmod +x deploy-vps-api.sh
+sudo ./deploy-vps-api.sh
 ```
 
-2. Запустите:
-```bash
-./deploy-vps-api.sh
-```
+Скрипт автоматически:
+1. Установит зависимости
+2. Создаст виртуальное окружение
+3. Настроит FastAPI + Uvicorn
+4. Сгенерирует SSL сертификат
+5. Запустит API на порту 443
 
-3. Введите:
-   - IP адрес VPS
-   - SSH пользователь (обычно root)
-   - Путь к SSH ключу
+После установки вы получите URL и Bearer токен.
 
 ## Использование API
 
-После установки получите:
-- URL: `https://<VPS_IP>/api/exec`
-- Bearer Token: выводится после установки
-
-### Пример запроса
+### Health check
 
 ```bash
-curl -k -X POST https://84.201.152.242/api/exec \
+curl -k https://<VPS_IP>/health
+```
+
+### Выполнение команды
+
+```bash
+curl -k -X POST https://<VPS_IP>/api/exec \
   -H "Authorization: Bearer <TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"command": "uptime"}'
@@ -59,24 +61,20 @@ curl -k -X POST https://84.201.152.242/api/exec \
 }
 ```
 
-### Доступные endpoints
+## Endpoints
 
-- `GET /health` — проверка работоспособности
-- `POST /api/exec` — выполнение команды
-
-## Безопасность
-
-- API токен генерируется случайный при каждой установке
-- Рекомендуется сменить токен после установки
-- Используйте firewall для ограничения доступа к порту 443
+| Method | Path | Описание |
+|--------|------|----------|
+| GET | `/` | Информация об API |
+| GET | `/health` | Проверка работоспособности |
+| POST | `/api/exec` | Выполнение команды |
 
 ## Удаление
 
-На VPS:
 ```bash
 systemctl stop vps-api.service
 systemctl disable vps-api.service
-rm /root/vps-api.py /root/key.pem /root/cert.pem
+rm /root/vps-api.py /root/key.pem /root/cert.pem /root/api-token.txt
 rm /etc/systemd/system/vps-api.service
 systemctl daemon-reload
 rm -rf /root/venv
