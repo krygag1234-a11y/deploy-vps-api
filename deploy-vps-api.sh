@@ -1,11 +1,11 @@
 #!/bin/bash
-# deploy-vps-api.sh — автоматическое разворачивание FastAPI REST API на VPS
-# Работает на чистом Ubuntu/Debian VPS
-# Usage: ./deploy-vps-api.sh
+# deploy-vps-api.sh — автоматическое разворачивание FastAPI REST API на чистом VPS
+# Работает на чистом Ubuntu 22.04+ / Debian 12+
+# Запустить: wget -O deploy-vps-api.sh https://raw.githubusercontent.com/krygag1234-a11y/deploy-vps-api/main/deploy-vps-api.sh && chmod +x deploy-vps-api.sh && sudo ./deploy-vps-api.sh
 
 set -e
 
-# Цвета для вывода
+# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -17,49 +17,47 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # Проверка root
 if [[ $EUID -ne 0 ]]; then
-   log_error "Запустите скрипт от root (sudo ./deploy-vps-api.sh)"
+   log_error "Запустите от root: sudo ./deploy-vps-api.sh"
    exit 1
 fi
 
-echo "=== VPS API Deployment Script ==="
-echo "Этот скрипт разворачивает FastAPI REST API на порту 443"
+echo "=== VPS API Deployment ==="
+echo "Разворачивание FastAPI REST API на порту 443"
 echo ""
 
-# Запрос данных
-read -p "Введите IP адрес VPS [127.0.0.1]: " VPS_IP
-VPS_IP="${VPS_IP:-127.0.0.1}"
+# Определение IP
+VPS_IP=$(hostname -I | awk '{print $1}')
+log_info "IP адрес: $VPS_IP"
 
-read -p "Введите SSH пользователя [root]: " SSH_USER
-SSH_USER="${SSH_USER:-root}"
+# Генерация токена
+API_TOKEN=$(openssl rand -base64 32 | tr -d '\n')
+log_info "API токен сгенерирован"
 
-read -p "Введите путь к SSH ключу: " SSH_KEY
-if [[ -z "$SSH_KEY" ]]; then
-    log_error "SSH ключ обязателен"
-    exit 1
-fi
+log_info "[1/6] Установка зависимостей..."
+apt update -qq
+apt install -y -qq python3.12-venv openssl curl >/dev/null 2>&1 || true
 
-if [[ ! -f "$SSH_KEY" ]]; then
-    log_error "SSH ключ не найден: $SSH_KEY"
-    exit 1
-fi
+log_info "[2/6] Создание виртуального окружения..."
+python3 -m venv /root/venv
 
-log_info "VPS: $SSH_USER@$VPS_IP"
-log_info "SSH Key: $SSH_KEY"
-echo ""
+log_info "[3/6] Установка FastAPI и Uvicorn..."
+/root/venv/bin/pip install --quiet fastapi 'uvicorn[standard]'
 
-# Генерация API токена
-API_TOKEN="$(openssl rand -base64 32 | tr -d '\n')"
-log_info "Сгенерирован API токен"
+log_info "[4/6] Генерация SSL сертификата..."
+openssl req -x509 -newkey rsa:2048 \
+  -keyout /root/key.pem -out /root/cert.pem \
+  -days 365 -nodes -subj "/CN=$VPS_IP" 2>/dev/null
 
-# Создание vps-api.py с токеном
-cat > /tmp/vps-api.py << EOF
+log_info "[5/6] Создание API приложения..."
+cat > /root/vps-api.py << 'PYEOF'
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import subprocess
+import socket
 
 app = FastAPI()
 
-API_TOKEN = "$API_TOKEN"
+API_TOKEN = "__TOKEN_PLACEHOLDER__"
 
 class CommandRequest(BaseModel):
     command: str
@@ -101,11 +99,17 @@ async def execute_command(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
-EOF
+    return {"status": "ok", "ip": socket.gethostbyname(socket.gethostname())}
 
-# Создание systemd service
-cat > /tmp/vps-api.service << EOF
+@app.get("/")
+async def root():
+    return {"message": "VPS API", "endpoints": ["/health", "/api/exec"]}
+PYEOF
+
+sed -i "s/__TOKEN_PLACEHOLDER__/$API_TOKEN/" /root/vps-api.py
+
+log_info "[6/6] Настройка systemd сервиса..."
+cat > /etc/systemd/system/vps-api.service << 'SVCEOF'
 [Unit]
 Description=VPS REST API
 After=network.target
@@ -120,66 +124,35 @@ RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SVCEOF
 
-log_info "[1/7] Обновление системы и установка зависимостей..."
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=30 "$SSH_USER@$VPS_IP" \
-  "apt update && apt install -y python3.12-venv openssl curl 2>&1 | tail -5"
+systemctl daemon-reload
+systemctl enable vps-api.service
+systemctl restart vps-api.service
 
-log_info "[2/7] Создание виртуального окружения..."
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$VPS_IP" \
-  "python3 -m venv /root/venv"
-
-log_info "[3/7] Установка FastAPI и Uvicorn..."
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$VPS_IP" \
-  "/root/venv/bin/pip install --quiet fastapi 'uvicorn[standard]'"
-
-log_info "[4/7] Генерация SSL сертификата..."
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$VPS_IP" \
-  "openssl req -x509 -newkey rsa:2048 -keyout /root/key.pem -out /root/cert.pem -days 365 -nodes -subj '/CN=$VPS_IP' 2>/dev/null"
-
-log_info "[5/7] Загрузка файлов на VPS..."
-scp -i "$SSH_KEY" -o StrictHostKeyChecking=no /tmp/vps-api.py "$SSH_USER@$VPS_IP:/root/vps-api.py"
-scp -i "$SSH_KEY" -o StrictHostKeyChecking=no /tmp/vps-api.service "$SSH_USER@$VPS_IP:/etc/systemd/system/vps-api.service"
-
-log_info "[6/7] Настройка systemd сервиса..."
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$VPS_IP" \
-  "systemctl daemon-reload && systemctl enable vps-api.service"
-
-log_info "[7/7] Запуск сервиса..."
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$VPS_IP" \
-  "systemctl stop vps-api.service 2>/dev/null; pkill -9 uvicorn 2>/dev/null; sleep 1; systemctl start vps-api.service"
+sleep 2
 
 log_info "Проверка..."
-sleep 3
-RESULT=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$VPS_IP" "curl -sk https://localhost/health" 2>/dev/null)
-
-if [[ "$RESULT" == *"ok"* ]]; then
+if curl -sk https://localhost/health | grep -q "ok"; then
   echo ""
-  echo -e "${GREEN}=== УСПЕХ! API развернут ===${NC}"
+  echo -e "${GREEN}=== ГОТОВО! ===${NC}"
   echo ""
-  echo "URL: https://$VPS_IP/api/exec"
-  echo "URL health: https://$VPS_IP/health"
+  echo "Health: https://$VPS_IP/health"
+  echo "API:    https://$VPS_IP/api/exec"
   echo ""
-  echo "API Token:"
+  echo "Токен:"
   echo "$API_TOKEN"
   echo ""
-  echo "Пример использования:"
+  echo "Пример:"
   echo "curl -k -X POST https://$VPS_IP/api/exec \\"
   echo "  -H 'Authorization: Bearer $API_TOKEN' \\"
   echo "  -H 'Content-Type: application/json' \\"
   echo "  -d '{\"command\": \"uptime\"}'"
   echo ""
-  echo "Ответ: {\"stdout\": \"...\", \"stderr\": \"...\", \"exit_code\": 0}"
-
-  # Сохранение токена в файл
-  echo "$API_TOKEN" > /tmp/vps-api-token.txt
-  log_info "Токен сохранён в /tmp/vps-api-token.txt"
+  echo "Токен сохранён в: /root/api-token.txt"
+  echo "$API_TOKEN" > /root/api-token.txt
 else
-  log_error "Ошибка: API не отвечает"
-  log_info "Логи: journalctl -u vps-api.service -n 20"
+  log_error "Ошибка запуска. Логи:"
+  journalctl -u vps-api.service -n 10 --no-pager
   exit 1
 fi
-
-# Очистка
-rm -f /tmp/vps-api.py /tmp/vps-api.service
