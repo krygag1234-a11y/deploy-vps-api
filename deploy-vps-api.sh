@@ -28,6 +28,9 @@ FALLBACK_PORT="${FALLBACK_PORT:-80}"      # пустая строка/0 = не �
 API_TOKEN="${API_TOKEN:-}"
 SELF_SIGNED=0
 EXEC_TIMEOUT="${API_EXEC_TIMEOUT:-90}"
+EXEC_CONCURRENCY="${API_EXEC_CONCURRENCY:-4}"
+EXEC_MAX_OUTPUT_BYTES="${API_EXEC_MAX_OUTPUT_BYTES:-1048576}"
+EXEC_KILL_GRACE="${API_EXEC_KILL_GRACE:-3}"
 ASSUME_YES=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,12 +40,20 @@ while [[ $# -gt 0 ]]; do
     --fallback-port) FALLBACK_PORT="$2"; shift 2;;
     --token) API_TOKEN="$2"; shift 2;;
     --exec-timeout) EXEC_TIMEOUT="$2"; shift 2;;
+    --exec-concurrency) EXEC_CONCURRENCY="$2"; shift 2;;
+    --max-output-bytes) EXEC_MAX_OUTPUT_BYTES="$2"; shift 2;;
+    --kill-grace) EXEC_KILL_GRACE="$2"; shift 2;;
     --self-signed) SELF_SIGNED=1; shift;;
     -y|--yes) ASSUME_YES=1; shift;;
     -h|--help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) log_error "Неизвестный аргумент: $1"; exit 1;;
   esac
 done
+
+[[ "$EXEC_TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] || { log_error "--exec-timeout должен быть положительным числом"; exit 1; }
+[[ "$EXEC_CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || { log_error "--exec-concurrency должен быть целым числом > 0"; exit 1; }
+[[ "$EXEC_MAX_OUTPUT_BYTES" =~ ^[1-9][0-9]*$ ]] || { log_error "--max-output-bytes должен быть целым числом > 0"; exit 1; }
+[[ "$EXEC_KILL_GRACE" =~ ^[0-9]+([.][0-9]+)?$ ]] || { log_error "--kill-grace должен быть положительным числом"; exit 1; }
 
 # ── Публичный IP (НЕ внутренний hostname -I) ─────────────────────────────────
 detect_public_ip(){
@@ -90,6 +101,16 @@ if [[ -z "$API_TOKEN" ]]; then
   else API_TOKEN="$(openssl rand -base64 32 | tr -d '\n=+/' | cut -c1-40)"; log_info "Сгенерирован новый токен"; fi
 fi
 
+# Резервная копия текущей установки перед любыми перезаписями.
+BACKUP_DIR="/root/deploy-vps-api-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$BACKUP_DIR"
+for old_path in /root/vps-api.py /root/api-token.txt /etc/systemd/system/vps-api.service /etc/systemd/system/vps-api-fb.service; do
+  [[ -e "$old_path" ]] && cp -a "$old_path" "$BACKUP_DIR/"
+done
+printf '%s\n' "$API_TOKEN" > /root/api-token.txt
+chmod 600 /root/api-token.txt
+log_info "Резервная копия предыдущей установки: $BACKUP_DIR"
+
 # ── Зависимости ──────────────────────────────────────────────────────────────
 log_info "[1/6] Зависимости…"
 apt-get update -qq
@@ -130,47 +151,142 @@ log_info "[4/6] Приложение /root/vps-api.py…"
 cat > /root/vps-api.py << 'PYEOF'
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-import subprocess, socket, os
+import asyncio
+import contextlib
+import hmac
+import os
+from pathlib import Path
+import signal
+import socket
 
 app = FastAPI()
-API_TOKEN = "__TOKEN_PLACEHOLDER__"
-EXEC_TIMEOUT = int(os.environ.get("API_EXEC_TIMEOUT", "__TIMEOUT_PLACEHOLDER__"))
+API_TOKEN = Path(os.environ.get("API_TOKEN_FILE", "/root/api-token.txt")).read_text().strip()
+EXEC_TIMEOUT = float(os.environ.get("API_EXEC_TIMEOUT", "90"))
+EXEC_CONCURRENCY = max(1, int(os.environ.get("API_EXEC_CONCURRENCY", "4")))
+EXEC_MAX_OUTPUT_BYTES = max(4096, int(os.environ.get("API_EXEC_MAX_OUTPUT_BYTES", "1048576")))
+EXEC_KILL_GRACE = max(0.1, float(os.environ.get("API_EXEC_KILL_GRACE", "3")))
+EXEC_SLOTS = asyncio.Semaphore(EXEC_CONCURRENCY)
+
 
 class CommandRequest(BaseModel):
     command: str
+
 
 class CommandResponse(BaseModel):
     stdout: str
     stderr: str
     exit_code: int
 
+
 def _auth(authorization):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing authorization header")
-    if authorization.split(" ", 1)[1] != API_TOKEN:
+    if not hmac.compare_digest(authorization.split(" ", 1)[1], API_TOKEN):
         raise HTTPException(status_code=403, detail="Invalid token")
+
+
+async def _read_limited(stream):
+    kept = bytearray()
+    dropped = 0
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        available = max(0, EXEC_MAX_OUTPUT_BYTES - len(kept))
+        kept.extend(chunk[:available])
+        dropped += max(0, len(chunk) - available)
+    return bytes(kept), dropped
+
+
+def _decode_output(data, dropped):
+    text = data.decode("utf-8", errors="replace")
+    if dropped:
+        text += f"\n[output truncated: {dropped} bytes omitted]\n"
+    return text
+
+
+async def _stop_process_group(proc):
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=EXEC_KILL_GRACE)
+        except asyncio.TimeoutError:
+            pass
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    if proc.returncode is None:
+        with contextlib.suppress(Exception):
+            await proc.wait()
+
+
+async def _collect(proc, stdout_task, stderr_task):
+    await proc.wait()
+    return await asyncio.gather(stdout_task, stderr_task)
+
 
 @app.post("/api/exec")
 async def execute_command(request: CommandRequest, authorization: str = Header(None)):
     _auth(authorization)
-    try:
-        r = subprocess.run(request.command, shell=True, capture_output=True, text=True, timeout=EXEC_TIMEOUT)
-        return CommandResponse(stdout=r.stdout, stderr=r.stderr, exit_code=r.returncode)
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=408, detail="Command timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    async with EXEC_SLOTS:
+        proc = None
+        stdout_task = None
+        stderr_task = None
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                request.command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            stdout_task = asyncio.create_task(_read_limited(proc.stdout))
+            stderr_task = asyncio.create_task(_read_limited(proc.stderr))
+            (stdout_data, stdout_dropped), (stderr_data, stderr_dropped) = await asyncio.wait_for(
+                _collect(proc, stdout_task, stderr_task), timeout=EXEC_TIMEOUT
+            )
+            return CommandResponse(
+                stdout=_decode_output(stdout_data, stdout_dropped),
+                stderr=_decode_output(stderr_data, stderr_dropped),
+                exit_code=proc.returncode,
+            )
+        except asyncio.TimeoutError:
+            if proc is not None:
+                await _stop_process_group(proc)
+            for task in (stdout_task, stderr_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            raise HTTPException(status_code=408, detail=f"Command timeout after {EXEC_TIMEOUT:g}s")
+        except asyncio.CancelledError:
+            if proc is not None:
+                await _stop_process_group(proc)
+            for task in (stdout_task, stderr_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            raise
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if proc is not None:
+                await _stop_process_group(proc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "host": socket.gethostname()}
+    return {
+        "status": "ok",
+        "host": socket.gethostname(),
+        "exec_timeout": EXEC_TIMEOUT,
+        "exec_concurrency": EXEC_CONCURRENCY,
+        "max_output_bytes": EXEC_MAX_OUTPUT_BYTES,
+    }
+
 
 @app.get("/")
 async def root():
     return {"message": "VPS API", "endpoints": ["/health", "/api/exec"]}
 PYEOF
-sed -i "s/__TOKEN_PLACEHOLDER__/$API_TOKEN/" /root/vps-api.py
-sed -i "s/__TIMEOUT_PLACEHOLDER__/$EXEC_TIMEOUT/" /root/vps-api.py
+/root/venv/bin/python3 -m py_compile /root/vps-api.py
 
 # ── systemd units: основной + запасной ───────────────────────────────────────
 log_info "[5/6] systemd (основной :$PRIMARY_PORT + запасной :$FALLBACK_PORT)…"
@@ -185,6 +301,9 @@ Type=simple
 User=root
 WorkingDirectory=/root
 Environment=API_EXEC_TIMEOUT=$EXEC_TIMEOUT
+Environment=API_EXEC_CONCURRENCY=$EXEC_CONCURRENCY
+Environment=API_EXEC_MAX_OUTPUT_BYTES=$EXEC_MAX_OUTPUT_BYTES
+Environment=API_EXEC_KILL_GRACE=$EXEC_KILL_GRACE
 ExecStart=/root/venv/bin/uvicorn vps-api:app --host 0.0.0.0 --port $2 --ssl-keyfile $KEY --ssl-certfile $CERT
 Restart=always
 RestartSec=5
@@ -223,7 +342,7 @@ fi
 
 # ── Проверка ─────────────────────────────────────────────────────────────────
 log_info "[6/6] Проверка…"
-echo "$API_TOKEN" > /root/api-token.txt; chmod 600 /root/api-token.txt
+chmod 600 /root/api-token.txt
 sleep 2
 ok=1
 curl -sk -m 8 "https://localhost:$PRIMARY_PORT/health" | grep -q '"ok"' || ok=0
