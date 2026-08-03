@@ -66,6 +66,24 @@ curl -s -X POST https://api.example.com:80/api/exec -H "Authorization: Bearer <T
 
 Для команды, которая должна жить дольше HTTP-запроса, используйте отдельную systemd-задачу (`systemd-run`): API сразу вернёт управление, а статус и журнал можно запросить следующим вызовом.
 
+## Постоянный SSH relay
+
+Если exec API используется как промежуточный узел для управления другой VPS, установите постоянный SSH ControlMaster-канал:
+
+```bash
+sudo ./install-ssh-relay.sh \
+  --name ru-olc \
+  --target root@203.0.113.10 \
+  --key /root/.ssh/relay_key
+```
+
+Установщик создаёт `olc-relay-ru-olc.service` с автоматическим перезапуском и клиентский SSH-конфиг в `/etc/ssh/ssh_config.d/`. После этого короткие exec-вызовы используют алиас:
+
+```bash
+ssh ru-olc 'systemctl is-active olcrtc-manager'
+```
+
+Они повторно используют уже открытый ControlMaster-сокет, поэтому не выполняют новый SSH handshake при каждом запросе. Целевой IP может быть любым; динамический IP самого API-узла должен обслуживаться DDNS-доменом, через который вызывается HTTPS exec API.
 ## Endpoints
 
 | Method | Path | Описание |
