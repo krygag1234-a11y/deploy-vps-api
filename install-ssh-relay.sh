@@ -91,7 +91,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/ssh -NT $NAME
+RuntimeDirectory=olc-ssh-relay
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/ssh -NT -o ControlMaster=yes -o ControlPersist=no $NAME
 Restart=always
 RestartSec=5
 
